@@ -62,6 +62,7 @@
 //#define DEBUG
 #define SIMMOD
 
+#define MAX_LCORE    4
 #define RX_RING_SIZE 128
 #define TX_RING_SIZE 512
 
@@ -84,14 +85,23 @@ static unsigned nb_ports;
 struct rte_mempool *mbuf_pool;
 
 /* the Lua interpreter */
-lua_State* L;
+lua_State* L; /* for main */
 
-#define NUM_TESTS	2
+lua_State* spam_tls[MAX_LCORE];
+
+#define NUM_TESTS	20
 #define RDNS_SERV	"8.8.8.8"
+#define LOCAL_SERV	"10.0.2.3"
 #define RDNS_PORT	53
+
 static char buff[NUM_TESTS + 1][128];
-static int tot_tests = NUM_TESTS;
-static int remain_tests = 0;
+static volatile int finished = 0;
+static volatile int remain_tests = 0;
+static volatile int cur_tail = 0;
+static volatile int cur_head = 0;
+
+struct rdns_resolver *resolver_ev;
+struct ev_loop *eloop;
 
 static void
 rdns_regress_callback (struct rdns_reply *reply, void *arg)
@@ -100,7 +110,9 @@ rdns_regress_callback (struct rdns_reply *reply, void *arg)
 	char out[INET6_ADDRSTRLEN + 1];
 	const struct rdns_request_name *name;
 
-	printf("In the callback function with lcore = %u\n", rte_lcore_id());
+	//llpm_entry_add
+	//printf("In the callback function with lcore = %u\n", rte_lcore_id());
+	lua_State *tl = spam_tls[rte_lcore_id()];
 
 	if (reply->code == RDNS_RC_NOERROR) {
 		entry = reply->entries;
@@ -108,6 +120,23 @@ rdns_regress_callback (struct rdns_reply *reply, void *arg)
 			if (entry->type == RDNS_REQUEST_A) {
 				inet_ntop (AF_INET, &entry->content.a.addr, out, sizeof (out));
 				printf ("%s has A record %s\n", (char *)arg, out);
+		
+				int ip4[4];
+				sscanf(arg, "%d.%d.%d.%d.zen.spamhaus.org", &ip4[0], &ip4[1], &ip4[2], &ip4[3]);
+				unsigned int ip = (ip4[3] << 24) + (ip4[2] << 16) + (ip4[1] << 8) + ip4[0];
+				
+				lua_checkstack(tl, 20);
+				/* push functions and arguments */
+				lua_getglobal(tl, "llpm_entry_add"); /* function to be called */
+
+				lua_pushinteger(tl, ip);   /* push 1st argument */
+				lua_pushinteger(tl, 32);   /* push 2nd argument */
+				lua_pushinteger(tl, 1);   /* push 2nd argument */
+
+				if (lua_pcall(tl, 3, 1, 0) != 0)
+					error(tl, "error running function `llpm_entry_add': %s", lua_tostring(tl, -1));
+
+				lua_pop(tl, 1);  /* pop returned value */
 			}
 			else if (entry->type == RDNS_REQUEST_AAAA) {
 				inet_ntop (AF_INET6, &entry->content.aaa.addr, out, sizeof (out));
@@ -153,41 +182,33 @@ rdns_regress_callback (struct rdns_reply *reply, void *arg)
 				rdns_strtype (name->type),
 				(char *)arg,
 				rdns_strerror (reply->code));
+		
+		int ip4[4];
+		sscanf(arg, "%d.%d.%d.%d.zen.spamhaus.org", &ip4[0], &ip4[1], &ip4[2], &ip4[3]);
+		unsigned int ip = (ip4[3] << 24) + (ip4[2] << 16) + (ip4[1] << 8) + ip4[0];
+
+		//printf("%d.%d.%d.%d\n", ip4[3], ip4[2], ip4[1], ip4[0]);
+
+		lua_checkstack(tl, 20);
+		/* push functions and arguments */
+		lua_getglobal(tl, "llpm_entry_add"); /* function to be called */
+
+		lua_pushinteger(tl, ip);   /* push 1st argument */
+		lua_pushinteger(tl, 32);   /* push 2nd argument */
+		lua_pushinteger(tl, 0);   /* push 2nd argument */
+
+		if (lua_pcall(tl, 3, 1, 0) != 0)
+			error(tl, "error running function `llpm_entry_add': %s", lua_tostring(tl, -1));
+
+		lua_pop(tl, 1);  /* pop returned value */
 	}
 
-    printf("remain_tests = %d; tot_tests = %d\n", remain_tests, tot_tests);
-	if (--remain_tests == 0 && tot_tests == 0) {
+	if (--remain_tests == 0 && finished == 1) {
 		printf ("End of test cycle\n");
 		rdns_resolver_release (reply->resolver);
 	}
 }
 
-    static void
-rdns_test_a (struct rdns_resolver *resolver)
-{
-#if 1
-    char *addr = "2.0.0.127.zen.spamhaus.org";
-    rdns_make_request_full (resolver, rdns_regress_callback, addr, 1.0, 2, 1, addr, RDNS_REQUEST_A);
-    remain_tests++;
-
-    while (tot_tests > 0) {
-        memset(buff[NUM_TESTS - tot_tests], 0, sizeof(buff[NUM_TESTS - tot_tests]));
-
-        printf("Please input the IP address to lookup the zen.spamhaus.org block lists!\n");
-        scanf("%s", buff[NUM_TESTS - tot_tests]);
-        strcat(buff[NUM_TESTS - tot_tests], ".zen.spamhaus.org");
-
-        printf("The lookup is %s\n", buff[NUM_TESTS - tot_tests]);
-
-        rdns_make_request_full (resolver, rdns_regress_callback, buff[NUM_TESTS - tot_tests], 1.0, 2, 1, buff[NUM_TESTS - tot_tests], RDNS_REQUEST_A);
-        remain_tests ++;
-
-        tot_tests--;
-    }
-
-    printf("tot_tests = %d\n", tot_tests);
-#endif
-}
 /* simulation test */
 
 static struct ipv4_hdr ip_hdr_template[1];
@@ -284,25 +305,19 @@ port_init(uint8_t port, struct rte_mempool *mbuf_pool)
 	static int
 lpm_main_loop(__attribute__((unused)) void *arg)
 {
-	struct rdns_resolver *resolver_ev;
-	struct ev_loop *eloop;
-
+	/* initialize the rdns resolver */
 	eloop = ev_default_loop (0);
 	resolver_ev = rdns_resolver_new ();
 	rdns_bind_libev (resolver_ev, eloop);
 
-	rdns_resolver_add_server (resolver_ev, RDNS_SERV, RDNS_PORT, 0, 8);
+	//rdns_resolver_add_server (resolver_ev, RDNS_SERV, RDNS_PORT, 0, 8);
+	rdns_resolver_add_server (resolver_ev, LOCAL_SERV, RDNS_PORT, 0, 8);
 
 	rdns_resolver_init (resolver_ev);
 
-	rdns_test_a (resolver_ev);
-	ev_loop (eloop, 0);
-
-	printf("All rdns requests are finished!!!\n");
-
-	return;
-
+	/* create Lua State for this lcore */
 	lua_State *tl = lua_newthread(L);
+	spam_tls[rte_lcore_id()] = tl;
 
 #ifndef SIMMOD
 	uint8_t port;
@@ -358,59 +373,98 @@ lpm_main_loop(__attribute__((unused)) void *arg)
 		}
 	}
 #else
-	int loop = 10;
+	int repeat = 1;
 
-	while (loop-- > 0) {
-		struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+	while (repeat-- > 0) {
+		printf("######Repeat %d\n", 2 - repeat);
+		int loop = 10;
+
+		while (loop-- > 0) {
+			struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
 #ifdef DEBUG
-		printf("*******************Construct PKT*******************\n");
+			printf("*******************Construct PKT*******************\n");
 #endif
-		mbuf->packet_type |= RTE_PTYPE_L3_IPV4;
-		struct ether_hdr *pneth = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf, sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
-		//struct ether_hdr *pneth = rte_pktmbuf_mtod(&mbuf, struct ether_hdr *);
-		struct ipv4_hdr *ip = (struct ipv4_hdr *) &pneth[1];
+			mbuf->packet_type |= RTE_PTYPE_L3_IPV4;
+			struct ether_hdr *pneth = (struct ether_hdr *)rte_pktmbuf_prepend(mbuf, sizeof(struct ether_hdr) + sizeof(struct ipv4_hdr));
+			//struct ether_hdr *pneth = rte_pktmbuf_mtod(&mbuf, struct ether_hdr *);
+			struct ipv4_hdr *ip = (struct ipv4_hdr *) &pneth[1];
 
-		pneth = rte_memcpy(pneth, &l2_hdr_template[0],
-				sizeof(struct ether_hdr));
+			pneth = rte_memcpy(pneth, &l2_hdr_template[0],
+					sizeof(struct ether_hdr));
 
-		ip = rte_memcpy(ip, &ip_hdr_template[0],
-				sizeof(struct ipv4_hdr));
+			ip = rte_memcpy(ip, &ip_hdr_template[0],
+					sizeof(struct ipv4_hdr));
 
-		unsigned int new_ip_addr = 0;
+			unsigned int new_ip_addr = 0;
 
-		new_ip_addr += loop * (1 << 24) + (1 << 16) + (1 << 8) + loop;
+			//new_ip_addr += loop * (1 << 24) + (1 << 16) + (1 << 8) + loop;
 
-		ip->dst_addr = rte_cpu_to_be_32(new_ip_addr);
+			new_ip_addr += 127 * (1 << 24) + loop;
+
+			ip->dst_addr = rte_cpu_to_be_32(new_ip_addr);
+
+			//char out[INET6_ADDRSTRLEN + 1];
+			//inet_ntop (AF_INET, &ip->dst_addr, out, sizeof (out));
+			//unsigned int le_ip = rte_be_to_cpu_32(ip->dst_addr);
+			//inet_ntop (AF_INET, &le_ip, out, sizeof (out));
+			//printf("The Dest IP is = %s\n", out);
 
 #ifdef DEBUG
-		unsigned int len = rte_pktmbuf_data_len(mbuf);
-		rte_pktmbuf_dump(stdout, mbuf, len);
+			unsigned int len = rte_pktmbuf_data_len(mbuf);
+			rte_pktmbuf_dump(stdout, mbuf, len);
 
-		printf("***************PKT LOOKUP**************\n");
+			printf("***************PKT LOOKUP**************\n");
 #endif
-		lua_checkstack(tl, 20);
+			lua_checkstack(tl, 20);
 
-		/* push functions and arguments */
-		lua_getglobal(tl, "llpm_get_dst_port"); /* function to be called */
-		lua_pushlightuserdata(tl, (void *)mbuf);   /* push 1st argument */
-		//lua_pushinteger(tl, 0);   /* push 2nd argument */
+			/* push functions and arguments */
+			lua_getglobal(tl, "llpm_get_dst_port"); /* function to be called */
+			lua_pushlightuserdata(tl, (void *)mbuf);   /* push 1st argument */
+			//lua_pushinteger(tl, 0);   /* push 2nd argument */
 
-		if (lua_pcall(tl, 1, 1, 0) != 0)
-			error(tl, "error running function `llpm_get_dst_port': %s", lua_tostring(tl, -1));
+			if (lua_pcall(tl, 1, 1, 0) != 0)
+				error(tl, "error running function `llpm_get_dst_port': %s", lua_tostring(tl, -1));
 
-		/* retrieve result */
-		int nexthop = 0;
-		nexthop = lua_tointeger(tl, -1);
-		lua_pop(tl, 1);  /* pop returned value */
+			/* retrieve result */
+			int nexthop = 0;
+			nexthop = lua_tointeger(tl, -1);
+			lua_pop(tl, 1);  /* pop returned value */
 
-		printf("LCORE %d#######The next hop is %d for %d.1.1.%d\n", rte_lcore_id(), nexthop, loop, loop);
+			char out[INET6_ADDRSTRLEN + 1];
+			inet_ntop (AF_INET, &ip->dst_addr, out, sizeof (out));
+			printf("LCORE %d#######The next hop is %d for %s\n", rte_lcore_id(), nexthop, out);
 
-		rte_pktmbuf_free(mbuf);
+			if (nexthop == 255) {
+				//char *addr = "2.0.0.127.zen.spamhaus.org";
+				unsigned int le_ip = rte_be_to_cpu_32(ip->dst_addr);
 
-		sleep(rand()%10);
+				memset(out, 0, sizeof(out));
+				inet_ntop (AF_INET, &le_ip, out, sizeof (out));
+
+				memset(buff[cur_head % NUM_TESTS], 0, sizeof(char) * 128);
+				strncpy(buff[cur_head % NUM_TESTS], out, strlen(out));
+				strcat(buff[cur_head % NUM_TESTS], ".zen.spamhaus.org");
+
+				rdns_make_request_full (resolver_ev, rdns_regress_callback, buff[cur_head % NUM_TESTS], 1.0, 2, 1, buff[cur_head % NUM_TESTS], RDNS_REQUEST_A);
+				//rdns_make_request_full (resolver_ev, rdns_regress_callback, buff[cur_tail % NUM_TESTS], 1.0, 2, 1, buff[cur_tail % NUM_TESTS], RDNS_REQUEST_A);
+				//rdns_make_request_full (resolver_ev, rdns_regress_callback, addr, 1.0, 2, 1, addr, RDNS_REQUEST_A);
+				cur_head++;
+				remain_tests++;
+				//ev_loop (eloop, 0);
+			}
+
+			rte_pktmbuf_free(mbuf);
+
+			//sleep(rand()%3);
+		}
 	}
-
 #endif
+	finished = 1;
+
+	ev_loop (eloop, 0);
+
+	printf("All rdns requests are finished!!!\n");
+
 	return 0;
 }
 
@@ -470,17 +524,15 @@ main(int argc, char **argv)
 
 #if 1
 	/* load the script */
-	luaL_loadfile(L, "./lpm.lua");
-	//luaL_loadfile(L, "./test.lua");
+	luaL_loadfile(L, "./spam.lua");
 	if (lua_pcall(L, 0, 0, 0) != 0)
-		error(L, "error running function `lpm.lua': %s", lua_tostring(L, -1));
+		error(L, "error running function `spam.lua': %s", lua_tostring(L, -1));
 
 	printf("After load the lua file!!!\n");
 	/* setup the LPM table */
-	lua_getglobal(L, "llpm_setup");
-	//lua_getglobal(L, "test");
+	lua_getglobal(L, "lpm_init");
 	if (lua_pcall(L, 0, 0, 0) != 0)
-		error(L, "error running function `llpm_setup': %s", lua_tostring(L, -1));
+		error(L, "error running function `lpm_init': %s", lua_tostring(L, -1));
 #endif
 
 #if 0

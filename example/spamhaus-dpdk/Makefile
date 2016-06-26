@@ -46,12 +46,12 @@ APP = spamhaus
 # all source are stored in SRCS-y
 SRCS-y := main.c
 
-INCDIR += -I/home/developer/lua/lua-5.1.5/include -I/home/developer/ddos-system/librdns/include
-#INCDIR += -I/home/vagrant/ddos/lua-5.1.5/include
+#INCDIR += -I/home/developer/lua/lua-5.1.5/include -I/home/developer/ddos-system/librdns/include
+INCDIR += -I/home/vagrant/ddos/lua-5.1.5/include -I/home/vagrant/ddos/librdns/include
 #LDIR += -L/home/developer/lua/lua-5.1.5/lib
 #LDLIBS += $(LDIR) -lm -llua
 #LDLIBS += $(LDIR) -lm -lluajit-5.1
-LDLIBS += -lm -lluajit-5.1 -lrdns -lev -L/home/developer/ddos-system/librdns
+LDLIBS += -lm -lluajit-5.1 -lrdns -lev -L/home/vagrant/ddos/librdns
 CFLAGS += -O3
 #CFLAGS += $(WERROR_FLAGS) $(INCDIR)
 CFLAGS += $(INCDIR)
